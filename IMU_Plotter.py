@@ -4,18 +4,20 @@ import numpy as np
 from pathlib import Path
 
 imu_channels = [
-    "qw", "qx", "qy", "qz",
     "acc_x", "acc_y", "acc_z",
     "gyro_x", "gyro_y", "gyro_z"
 ]
 
-for trial_no in range(1, 6):
-    df = pd.read_csv(f"trial_0{trial_no}/imu_data.csv")
+num_trials = 100
+base_dir = Path("Saharsh_13_Feb")
+
+for trial_no in range(1, num_trials + 1):
+    df = pd.read_csv(base_dir / f"trial_{trial_no:02d}" / "imu_wrist_data.csv")
 
     N = len(df)
     time_sec = np.linspace(0, 6, N)
 
-    out_dir = Path(f"IMU_Plots/Trial {trial_no}")
+    out_dir = base_dir / f"Wrist_IMU_Plots/Trial {trial_no}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for channel in imu_channels:

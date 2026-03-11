@@ -3,8 +3,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 
-for trial_no in range(1,6):
-    df = pd.read_csv(f"trial_0{trial_no}/emg_envelope.csv")
+num_trials = 26
+base_dir = Path("Saharsh_13_Feb")
+
+for trial_no in range(1, num_trials + 1):
+    df = pd.read_csv(base_dir / f"trial_{trial_no:02d}" / "emg_envelope.csv")
 
     time_col = "timestamp"
     emg_cols = df.columns.drop(time_col)
@@ -12,7 +15,7 @@ for trial_no in range(1,6):
     N = len(df)
     time_sec = np.linspace(0, 6, N)
 
-    out_dir = Path(f"EMG_Envelope_Plots/Trial {trial_no}")
+    out_dir = base_dir / "Plots/EMG_Envelope_Plots" / f"Trial {trial_no}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     channel_no = 0
