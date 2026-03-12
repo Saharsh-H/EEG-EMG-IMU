@@ -1,23 +1,25 @@
-# model.py
 import torch
 import torch.nn as nn
+
 
 # ==============================
 # TCN Residual Block
 # ==============================
 
 class TemporalBlock(nn.Module):
+
     def __init__(self, in_channels, out_channels, kernel_size, dilation):
 
         super().__init__()
 
-        padding = (kernel_size - 1) * dilation // 2
+        padding1 = (kernel_size - 1) * dilation // 2
+        padding2 = (kernel_size - 1) * (dilation * 2) // 2
 
         self.conv1 = nn.Conv1d(
             in_channels,
             out_channels,
             kernel_size,
-            padding=padding,
+            padding=padding1,
             dilation=dilation
         )
 
@@ -27,8 +29,8 @@ class TemporalBlock(nn.Module):
             out_channels,
             out_channels,
             kernel_size,
-            padding=padding,
-            dilation=dilation
+            padding=padding2,
+            dilation=dilation * 2
         )
 
         self.bn2 = nn.BatchNorm1d(out_channels)
@@ -39,6 +41,7 @@ class TemporalBlock(nn.Module):
         self.downsample = None
         if in_channels != out_channels:
             self.downsample = nn.Conv1d(in_channels, out_channels, 1)
+
 
     def forward(self, x):
 
@@ -63,7 +66,7 @@ class TemporalBlock(nn.Module):
 
 class EMG2IMU_CNN_TCN(nn.Module):
 
-    def __init__(self):
+    def __init__(self, output_channels=6):
 
         super().__init__()
 
@@ -98,25 +101,15 @@ class EMG2IMU_CNN_TCN(nn.Module):
         )
 
         # ------------------------------
-        # Temporal Aggregation
-        # ------------------------------
-
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-
-        # ------------------------------
         # Decoder
         # ------------------------------
 
         self.fc = nn.Sequential(
 
-            nn.Linear(64, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-
-            nn.Linear(128, 64),
+            nn.Linear(64, 32),
             nn.ReLU(),
 
-            nn.Linear(64, 6)
+            nn.Linear(32, output_channels)
         )
 
 
@@ -125,16 +118,14 @@ class EMG2IMU_CNN_TCN(nn.Module):
         # x shape
         # (batch, time, channels)
 
-        x = x.permute(0, 2, 1)   # (B, 8, 200)
+        x = x.permute(0, 2, 1)      # (B, 8, 200)
 
-        x = self.cnn(x)          # (B, 64, 200)
+        x = self.cnn(x)             # (B, 64, 200)
 
-        x = self.tcn(x)          # (B, 64, 200)
+        x = self.tcn(x)             # (B, 64, 200)
 
-        x = self.global_pool(x)  # (B, 64, 1)
+        x = x[:, :, -1]             # last timestep
 
-        x = x.squeeze(-1)        # (B, 64)
-
-        out = self.fc(x)         # (B, 6)
+        out = self.fc(x)            # (B, output_channels)
 
         return out

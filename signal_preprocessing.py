@@ -14,17 +14,23 @@ BP_LOW = 1.0
 BP_HIGH = 40.0
 ENV_LP = 1.5
 
-ACC_LP = 15.0     # accelerometer LPF
-GYRO_LP = 6.0     # gyroscope LPF
+ACC_LP = 15.0
+GYRO_LP = 6.0
 
 FILTER_ORDER = 4
 
 TIME_COL = "timestamp"
 N_TRIALS = 26
-base_dir = Path("Saharsh_13_Feb")
+
+# Subjects
+SUBJECT_DIRS = [
+    Path("Saharsh_13_Feb"),
+    Path("Aabha_13_Feb")
+]
 
 ACC_CHANNELS = ["acc_x","acc_y","acc_z"]
 GYRO_CHANNELS = ["gyro_x","gyro_y","gyro_z"]
+
 
 # ============================================================
 # FILTER FUNCTIONS
@@ -37,11 +43,13 @@ def bandpass_filter(signal, fs, lowcut, highcut, order):
     b, a = butter(order, [low, high], btype="band")
     return filtfilt(b, a, signal)
 
+
 def lowpass_filter(signal, fs, cutoff, order):
     nyq = 0.5 * fs
     norm_cutoff = cutoff / nyq
     b, a = butter(order, norm_cutoff, btype="low")
     return filtfilt(b, a, signal)
+
 
 # ============================================================
 # CORE EMG ENVELOPE PIPELINE
@@ -69,6 +77,7 @@ def compute_emg_envelope(raw_signal, fs=FS_EMG):
     )
 
     return envelope_smooth
+
 
 # ============================================================
 # IMU PREPROCESSING
@@ -103,48 +112,67 @@ def preprocess_imu(df):
 # MAIN PROCESSING LOOP
 # ============================================================
 
-for trial_no in range(1, N_TRIALS + 1):
+for subject_dir in SUBJECT_DIRS:
 
-    trial_path = base_dir / f"trial_{trial_no:02d}"
+    print("\n===================================")
+    print("Processing subject:", subject_dir.name)
+    print("===================================\n")
 
-    # =========================
-    # EMG ENVELOPE GENERATION
-    # =========================
+    for trial_no in range(1, N_TRIALS + 1):
 
-    input_csv = trial_path / "emg_data.csv"
-    output_csv = trial_path / "emg_envelope.csv"
+        trial_path = subject_dir / f"trial_{trial_no:02d}"
 
-    print(f"Processing {input_csv} ...")
+        # =========================
+        # EMG ENVELOPE GENERATION
+        # =========================
 
-    df = pd.read_csv(input_csv)
+        input_csv = trial_path / "emg_data.csv"
+        output_csv = trial_path / "emg_envelope.csv"
 
-    emg_cols = df.columns.drop(TIME_COL)
+        print(f"Processing {input_csv} ...")
 
-    env_df = pd.DataFrame()
-    env_df[TIME_COL] = df[TIME_COL]
+        try:
 
-    for ch in emg_cols:
-        raw_signal = df[ch].values
-        env_df[ch] = compute_emg_envelope(raw_signal)
+            df = pd.read_csv(input_csv)
 
-    env_df.to_csv(output_csv, index=False)
-    print(f"Saved {output_csv}")
+            emg_cols = df.columns.drop(TIME_COL)
 
-    # =========================
-    # IMU PREPROCESSING
-    # =========================
+            env_df = pd.DataFrame()
+            env_df[TIME_COL] = df[TIME_COL]
 
-    imu_input = trial_path / "imu_wrist_data.csv"
-    imu_output = trial_path / "imu_wrist_filtered.csv"
+            for ch in emg_cols:
+                raw_signal = df[ch].values
+                env_df[ch] = compute_emg_envelope(raw_signal)
 
-    print(f"Processing {imu_input} ...")
+            env_df.to_csv(output_csv, index=False)
 
-    imu_df = pd.read_csv(imu_input)
+            print(f"Saved {output_csv}")
 
-    imu_filtered = preprocess_imu(imu_df)
+        except Exception as e:
+            print(f"Skipping EMG for trial {trial_no}: {e}")
 
-    imu_filtered.to_csv(imu_output, index=False)
 
-    print(f"Saved {imu_output}")
+        # =========================
+        # IMU PREPROCESSING
+        # =========================
 
-print("All trials processed successfully.")
+        imu_input = trial_path / "imu_wrist_data.csv"
+        imu_output = trial_path / "imu_wrist_filtered.csv"
+
+        print(f"Processing {imu_input} ...")
+
+        try:
+
+            imu_df = pd.read_csv(imu_input)
+
+            imu_filtered = preprocess_imu(imu_df)
+
+            imu_filtered.to_csv(imu_output, index=False)
+
+            print(f"Saved {imu_output}")
+
+        except Exception as e:
+            print(f"Skipping IMU for trial {trial_no}: {e}")
+
+
+print("\nAll subjects processed successfully.")

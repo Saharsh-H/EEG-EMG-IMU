@@ -1,11 +1,11 @@
-# predict.py
-
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import joblib
+import pandas as pd
 
 from pathlib import Path
+from sklearn.metrics import r2_score
 
 from model import EMG2IMU_CNN_TCN
 from data_preparation import (
@@ -13,99 +13,295 @@ from data_preparation import (
     synchronize_signals,
     create_windows,
     EMG_CHANNELS,
-    IMU_CHANNELS,
-    BASE_DIR,
-    NUM_TRIALS
+    IMU_CHANNELS
 )
 
-# ==============================
-# LOAD MODEL + SCALERS
-# ==============================
+# ======================================
+# CONFIG
+# ======================================
 
-MODEL_DIR = BASE_DIR / "Models"
+SUBJECT_DIRS = [
+    Path("Saharsh_13_Feb"),
+    Path("Aabha_13_Feb")
+]
+
+NUM_TRIALS = 26
+TRAIN_SPLIT = 20
+
+MODEL_DIR = Path("models")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-model = EMG2IMU_CNN_TCN().to(device)
-
-model.load_state_dict(
-    torch.load(MODEL_DIR / "cnn_tcn_model.pt", map_location=device)
-)
-
-model.eval()
+# ======================================
+# LOAD SCALERS
+# ======================================
 
 emg_scaler = joblib.load(MODEL_DIR / "emg_scaler.pkl")
 imu_scaler = joblib.load(MODEL_DIR / "imu_scaler.pkl")
 
+# ======================================
+# LOAD TRAINED MODELS
+# ======================================
 
-# ==============================
-# OUTPUT DIRECTORY
-# ==============================
+model_files = list(MODEL_DIR.glob("*_model.pt"))
 
-out_root = BASE_DIR / "Plots/Reconstructed_IMU_Plots"
-out_root.mkdir(exist_ok=True)
+if len(model_files) == 0:
+    raise RuntimeError("No trained models found")
 
-# ==============================
-# LOOP THROUGH TRIALS
-# ==============================
+models = {}
 
-for trial_no in range(1, NUM_TRIALS + 1):
+for file in model_files:
 
-    print(f"Processing trial {trial_no}")
+    channel = file.stem.replace("_model", "")
 
-    trial_path = BASE_DIR / f"trial_{trial_no:02d}"
+    print("Loading model:", channel)
 
-    try:
+    model = EMG2IMU_CNN_TCN(output_channels=1).to(device)
 
-        emg, imu = load_trial(trial_path)
+    model.load_state_dict(
+        torch.load(file, map_location=device)
+    )
 
-        emg, imu = synchronize_signals(emg, imu)
+    model.eval()
 
-        X, Y = create_windows(emg, imu)
+    models[channel] = model
 
-        if len(X) == 0:
-            print("Skipping trial: not enough windows")
-            continue
+print("Channels loaded:", list(models.keys()))
 
-        # ---------- SCALE INPUT ----------
-        N, T, C = X.shape
+# ======================================
+# OUTPUT DIRECTORIES
+# ======================================
 
-        X_flat = X.reshape(-1, C)
-        X_scaled = emg_scaler.transform(X_flat)
-        X_scaled = X_scaled.reshape(N, T, C)
+recon_root = Path("Plots/Reconstructed_IMU_Plots")
+perf_root = Path("Plots/Performance")
 
-        X_tensor = torch.tensor(X_scaled).float().to(device)
+recon_root.mkdir(parents=True, exist_ok=True)
+perf_root.mkdir(parents=True, exist_ok=True)
 
-        # ---------- PREDICT ----------
-        with torch.no_grad():
-            pred_scaled = model(X_tensor).cpu().numpy()
+# ======================================
+# STORE PERFORMANCE RESULTS
+# ======================================
 
-        pred = imu_scaler.inverse_transform(pred_scaled)
+results = []
 
-        # ---------- PLOT ----------
-        out_dir = out_root / f"Trial {trial_no}"
-        out_dir.mkdir(parents=True, exist_ok=True)
+# ======================================
+# PROCESS DATA
+# ======================================
 
-        time = np.arange(len(pred))
+for subject_dir in SUBJECT_DIRS:
 
-        for i, ch in enumerate(IMU_CHANNELS):
+    print("\nProcessing subject:", subject_dir.name)
 
-            fig, ax = plt.subplots(figsize=(10,4))
+    subject_out = recon_root / subject_dir.name
+    subject_out.mkdir(exist_ok=True)
 
-            ax.plot(time, Y[:, i], label="True", linewidth=1)
-            ax.plot(time, pred[:, i], label="Predicted", linewidth=1)
+    for trial_no in range(1, NUM_TRIALS + 1):
 
-            ax.set_title(f"Trial {trial_no} {ch} Reconstruction")
-            ax.set_xlabel("Window Index")
-            ax.set_ylabel(ch)
+        print("Trial", trial_no)
 
-            ax.legend()
+        trial_path = subject_dir / f"trial_{trial_no:02d}"
 
-            fig.tight_layout()
+        try:
 
-            fig.savefig(out_dir / f"{ch}.png", dpi=300)
+            emg, imu = load_trial(trial_path)
 
-            plt.close(fig)
+            emg, imu = synchronize_signals(emg, imu)
 
-    except Exception as e:
-        print(f"Skipping trial {trial_no}: {e}")
+            X, Y = create_windows(emg, imu)
+
+            if len(X) == 0:
+                continue
+
+            # ======================================
+            # SCALE INPUT
+            # ======================================
+
+            N, T, C = X.shape
+
+            X_flat = X.reshape(-1, C)
+            X_scaled = emg_scaler.transform(X_flat)
+            X_scaled = X_scaled.reshape(N, T, C)
+
+            X_tensor = torch.tensor(X_scaled).float().to(device)
+
+            trial_out = subject_out / f"trial_{trial_no:02d}"
+            trial_out.mkdir(parents=True, exist_ok=True)
+
+            # ======================================
+            # PREDICT PER CHANNEL
+            # ======================================
+
+            for channel, model in models.items():
+
+                idx = IMU_CHANNELS.index(channel)
+
+                with torch.no_grad():
+                    pred_scaled = model(X_tensor).cpu().numpy()
+
+                # reconstruct full IMU vector for inverse scaling
+                pred_full = np.zeros((len(pred_scaled), len(IMU_CHANNELS)))
+                pred_full[:, idx] = pred_scaled[:,0]
+
+                pred = imu_scaler.inverse_transform(pred_full)[:, idx]
+
+                true = Y[:, idx]
+
+                r2 = r2_score(true, pred)
+
+                results.append({
+                    "subject": subject_dir.name,
+                    "trial": trial_no,
+                    "channel": channel,
+                    "r2": r2
+                })
+
+                # ======================================
+                # RECONSTRUCTION PLOT
+                # ======================================
+
+                time = np.arange(len(pred))
+
+                fig, ax = plt.subplots(figsize=(10,4))
+
+                ax.plot(time, true, label="True", linewidth=1)
+                ax.plot(time, pred, label="Predicted", linewidth=1)
+
+                ax.set_title(
+                    f"{subject_dir.name} Trial {trial_no} {channel} (R²={r2:.3f})"
+                )
+
+                ax.set_xlabel("Window Index")
+                ax.set_ylabel(channel)
+
+                ax.legend()
+
+                fig.tight_layout()
+
+                fig.savefig(
+                    trial_out / f"{channel}.png",
+                    dpi=300
+                )
+
+                plt.close(fig)
+
+        except Exception as e:
+            print("Skipping trial:", e)
+
+# ======================================
+# SAVE PERFORMANCE SUMMARY
+# ======================================
+
+results_df = pd.DataFrame(results)
+
+results_df.to_csv(
+    perf_root / "overall_results.csv",
+    index=False
+)
+
+print("Saved overall results.")
+
+# ======================================
+# R² VS TRIAL PLOTS
+# ======================================
+
+for channel in results_df["channel"].unique():
+
+    ch_data = results_df[results_df["channel"] == channel]
+
+    plt.figure(figsize=(8,5))
+
+    for subject in ch_data["subject"].unique():
+
+        sub = ch_data[ch_data["subject"] == subject]
+
+        plt.plot(
+            sub["trial"],
+            sub["r2"],
+            marker="o",
+            label=subject
+        )
+
+    plt.axvline(
+        x=TRAIN_SPLIT + 0.5,
+        linestyle="--",
+        color="red",
+        label="Train/Test Split"
+    )
+
+    plt.title(f"{channel} R² vs Trial")
+
+    plt.xlabel("Trial")
+    plt.ylabel("R²")
+
+    plt.legend()
+    plt.grid(True)
+
+    plt.savefig(
+        perf_root / f"{channel}_r2_vs_trial.png",
+        dpi=300
+    )
+
+    plt.close()
+
+# ======================================
+# TRAIN VS TEST DISTRIBUTION
+# ======================================
+
+for channel in results_df["channel"].unique():
+
+    ch_data = results_df[results_df["channel"] == channel]
+
+    train = ch_data[ch_data["trial"] <= TRAIN_SPLIT]["r2"]
+    test = ch_data[ch_data["trial"] > TRAIN_SPLIT]["r2"]
+
+    plt.figure(figsize=(6,5))
+
+    plt.boxplot(
+        [train, test],
+        tick_labels=["Train Trials", "Test Trials"]
+    )
+
+    plt.title(f"{channel} R² Distribution")
+
+    plt.ylabel("R²")
+    plt.grid(True)
+
+    plt.savefig(
+        perf_root / f"{channel}_r2_distribution.png",
+        dpi=300
+    )
+
+    plt.close()
+
+# ======================================
+# SUBJECT COMPARISON
+# ======================================
+
+for channel in results_df["channel"].unique():
+
+    ch_data = results_df[results_df["channel"] == channel]
+
+    subjects = ch_data["subject"].unique()
+
+    data = [
+        ch_data[ch_data["subject"] == s]["r2"]
+        for s in subjects
+    ]
+
+    plt.figure(figsize=(6,5))
+
+    plt.boxplot(data, tick_labels=subjects)
+
+    plt.title(f"{channel} R² by Subject")
+
+    plt.ylabel("R²")
+    plt.grid(True)
+
+    plt.savefig(
+        perf_root / f"{channel}_subject_comparison.png",
+        dpi=300
+    )
+
+    plt.close()
+
+print("Saved performance plots.")
