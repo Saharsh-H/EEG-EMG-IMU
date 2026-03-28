@@ -4,7 +4,7 @@ from scipy.signal import butter, filtfilt, hilbert
 from pathlib import Path
 
 # ============================================================
-# CONFIGURATION (LOCKED)
+# CONFIGURATION (UPDATED)
 # ============================================================
 
 FS_EMG = 100
@@ -20,17 +20,15 @@ GYRO_LP = 6.0
 FILTER_ORDER = 4
 
 TIME_COL = "timestamp"
-N_TRIALS = 26
 
-# Subjects
-SUBJECT_DIRS = [
-    Path("Saharsh_13_Feb"),
-    Path("Aabha_13_Feb")
-]
+# Root folder containing all subject folders
+DATA_ROOT = Path("23_March_Trials")
+
+# Automatically detect subjects
+SUBJECT_DIRS = [d for d in DATA_ROOT.iterdir() if d.is_dir()]
 
 ACC_CHANNELS = ["acc_x","acc_y","acc_z"]
 GYRO_CHANNELS = ["gyro_x","gyro_y","gyro_z"]
-
 
 # ============================================================
 # FILTER FUNCTIONS
@@ -109,7 +107,7 @@ def preprocess_imu(df):
 
 
 # ============================================================
-# MAIN PROCESSING LOOP
+# MAIN PROCESSING LOOP (FIXED)
 # ============================================================
 
 for subject_dir in SUBJECT_DIRS:
@@ -118,9 +116,13 @@ for subject_dir in SUBJECT_DIRS:
     print("Processing subject:", subject_dir.name)
     print("===================================\n")
 
-    for trial_no in range(1, N_TRIALS + 1):
+    # Automatically detect trials
+    trial_dirs = sorted([
+        d for d in subject_dir.iterdir()
+        if d.is_dir() and "trial_" in d.name
+    ])
 
-        trial_path = subject_dir / f"trial_{trial_no:02d}"
+    for trial_path in trial_dirs:
 
         # =========================
         # EMG ENVELOPE GENERATION
@@ -132,24 +134,28 @@ for subject_dir in SUBJECT_DIRS:
         print(f"Processing {input_csv} ...")
 
         try:
+            if not input_csv.exists():
+                raise FileNotFoundError("emg_data.csv missing")
 
-            df = pd.read_csv(input_csv)
+            if output_csv.exists():
+                print(f"Skipping (already exists): {output_csv}")
+            else:
+                df = pd.read_csv(input_csv)
 
-            emg_cols = df.columns.drop(TIME_COL)
+                emg_cols = df.columns.drop(TIME_COL)
 
-            env_df = pd.DataFrame()
-            env_df[TIME_COL] = df[TIME_COL]
+                env_df = pd.DataFrame()
+                env_df[TIME_COL] = df[TIME_COL]
 
-            for ch in emg_cols:
-                raw_signal = df[ch].values
-                env_df[ch] = compute_emg_envelope(raw_signal)
+                for ch in emg_cols:
+                    raw_signal = df[ch].values
+                    env_df[ch] = compute_emg_envelope(raw_signal)
 
-            env_df.to_csv(output_csv, index=False)
-
-            print(f"Saved {output_csv}")
+                env_df.to_csv(output_csv, index=False)
+                print(f"Saved {output_csv}")
 
         except Exception as e:
-            print(f"Skipping EMG for trial {trial_no}: {e}")
+            print(f"Skipping EMG for {trial_path.name}: {e}")
 
 
         # =========================
@@ -162,17 +168,21 @@ for subject_dir in SUBJECT_DIRS:
         print(f"Processing {imu_input} ...")
 
         try:
+            if not imu_input.exists():
+                raise FileNotFoundError("imu_wrist_data.csv missing")
 
-            imu_df = pd.read_csv(imu_input)
+            if imu_output.exists():
+                print(f"Skipping (already exists): {imu_output}")
+            else:
+                imu_df = pd.read_csv(imu_input)
 
-            imu_filtered = preprocess_imu(imu_df)
+                imu_filtered = preprocess_imu(imu_df)
 
-            imu_filtered.to_csv(imu_output, index=False)
-
-            print(f"Saved {imu_output}")
+                imu_filtered.to_csv(imu_output, index=False)
+                print(f"Saved {imu_output}")
 
         except Exception as e:
-            print(f"Skipping IMU for trial {trial_no}: {e}")
+            print(f"Skipping IMU for {trial_path.name}: {e}")
 
 
 print("\nAll subjects processed successfully.")

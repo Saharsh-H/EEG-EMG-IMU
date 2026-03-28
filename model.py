@@ -3,7 +3,7 @@ import torch.nn as nn
 
 
 # ==============================
-# TCN Residual Block
+# TCN Residual Block (FIXED)
 # ==============================
 
 class TemporalBlock(nn.Module):
@@ -12,14 +12,13 @@ class TemporalBlock(nn.Module):
 
         super().__init__()
 
-        padding1 = (kernel_size - 1) * dilation // 2
-        padding2 = (kernel_size - 1) * (dilation * 2) // 2
+        padding = (kernel_size - 1) * dilation // 2  # consistent SAME padding
 
         self.conv1 = nn.Conv1d(
             in_channels,
             out_channels,
             kernel_size,
-            padding=padding1,
+            padding=padding,
             dilation=dilation
         )
 
@@ -29,8 +28,8 @@ class TemporalBlock(nn.Module):
             out_channels,
             out_channels,
             kernel_size,
-            padding=padding2,
-            dilation=dilation * 2
+            padding=padding,
+            dilation=dilation
         )
 
         self.bn2 = nn.BatchNorm1d(out_channels)
@@ -38,9 +37,13 @@ class TemporalBlock(nn.Module):
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.2)
 
+        # Residual projection
         self.downsample = None
         if in_channels != out_channels:
-            self.downsample = nn.Conv1d(in_channels, out_channels, 1)
+            self.downsample = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, 1),
+                nn.BatchNorm1d(out_channels)
+            )
 
 
     def forward(self, x):
@@ -61,7 +64,7 @@ class TemporalBlock(nn.Module):
 
 
 # ==============================
-# CNN + TCN Network
+# CNN + TCN Network (FINAL)
 # ==============================
 
 class EMG2IMU_CNN_TCN(nn.Module):
@@ -88,7 +91,7 @@ class EMG2IMU_CNN_TCN(nn.Module):
         )
 
         # ------------------------------
-        # TCN Blocks
+        # TCN Blocks (stable dilation stack)
         # ------------------------------
 
         self.tcn = nn.Sequential(
@@ -112,11 +115,22 @@ class EMG2IMU_CNN_TCN(nn.Module):
             nn.Linear(32, output_channels)
         )
 
+        # Optional: better initialization
+        self._init_weights()
+
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d) or isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
 
     def forward(self, x):
 
-        # x shape
-        # (batch, time, channels)
+        # Input:
+        # (batch, time, channels) = (B, 200, 8)
 
         x = x.permute(0, 2, 1)      # (B, 8, 200)
 
@@ -124,8 +138,8 @@ class EMG2IMU_CNN_TCN(nn.Module):
 
         x = self.tcn(x)             # (B, 64, 200)
 
-        x = x[:, :, -1]             # last timestep
+        x = x[:, :, -1]             # last timestep → (B, 64)
 
-        out = self.fc(x)            # (B, output_channels)
+        out = self.fc(x)            # (B, 6)
 
         return out
