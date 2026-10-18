@@ -31,6 +31,10 @@ Non-network models:
   emg_direct    shift = EMG lag + constant (no slope fitted); _sum: lag of total EMG activity
                 (armband-rotation insensitive); _rot: lag searching 8 channel rotations.
                 With --split within the constant comes from the test subject's own trials (calibration).
+  emg_rel       lag measured against the person's OWN mean EMG envelope (their unlabelled EMG, all
+                trials, as in the deploy normalisation); _sub adds a person-level lag vs the population.
+  --base X      nets/ridge learn the deviation from timer X's EMG-shifted template, e.g.
+                python src/run_loso.py --models cnn_lstm cnn_tcn --loss mse --base emg_rel --wd 1e-4 --out results/hybrid
 """
 import argparse
 import time
@@ -72,6 +76,9 @@ def get_args():
     ap.add_argument("--residual", action="store_true",
                     help="nets/ridge learn the deviation from the training template (template added back)")
     ap.add_argument("--wd", type=float, default=0.0, help="Adam weight decay")
+    ap.add_argument("--base", default=None,
+                    help="nets/ridge learn the deviation from this EMG-timed template "
+                         "(emg_direct, emg_direct_rot, emg_rel, emg_rel_sub, ...)")
     return ap.parse_args()
 
 
@@ -248,11 +255,48 @@ def fit_emg_direct(Xcal, Ycal, tm, E_tm, mode):
     c = float(np.median(k_true - lag))
     r = float(np.corrcoef(lag, k_true)[0, 1]) if np.std(lag) > 0 else np.nan
 
-    def predict(X):
+    def predict(X, S=None):
         lg = np.array([emg_lag(E_tm, x, mode) for x in X])
         k = np.clip(lg + c, -MAX_SHIFT, MAX_SHIFT)
         return np.array([warp(tm, kk, 1.0, 0.0) for kk in k], dtype=np.float32), k, lg / FS
     return predict, r, c / FS
+
+
+# "relative" EMG timing: each trial's lag is measured against THAT PERSON'S OWN mean EMG envelope
+# (unlabelled: only their EMG is needed, as for the deploy normalisation), not other people's.
+#   emg_rel      person's average movement assumed to match the population template
+#   emg_rel_sub  + person-level lag = shift of the population mean EMG that matches the person's mean EMG
+REL = {"emg_rel": False, "emg_rel_sub": True}
+
+
+def fit_emg_rel(Xcal, Ycal, Scal, tm, E_subj, E_pop, use_sub):
+    sub_lag = {s: (emg_lag(E_pop, E_subj[s]) if use_sub else 0) for s in E_subj}
+
+    def lags(X, S):
+        out = np.zeros(len(X))
+        for s in np.unique(S):                  # grouped per person (keeps the shift bank cached)
+            idx = np.where(S == s)[0]
+            out[idx] = [emg_lag(E_subj[s], X[i]) + sub_lag[s] for i in idx]
+        return out
+
+    lag = lags(Xcal, Scal)
+    k_true = np.array([fit_template(tm, y, scale=False)[0] for y in Ycal])
+    c = float(np.median(k_true - lag))
+    r = float(np.corrcoef(lag, k_true)[0, 1]) if np.std(lag) > 0 else np.nan
+
+    def predict(X, S):
+        lg = lags(X, S)
+        k = np.clip(lg + c, -MAX_SHIFT, MAX_SHIFT)
+        return np.array([warp(tm, kk, 1.0, 0.0) for kk in k], dtype=np.float32), k, lg / FS
+    return predict, r, c / FS
+
+
+def fit_timer(name, Xn, Yn, subj, tidx, tm, E_tm):
+    """Fit an EMG-timed template (DIRECT or REL) on the calibration/template trials tidx."""
+    if name in DIRECT:
+        return fit_emg_direct(Xn[tidx], Yn[tidx], tm, E_tm, DIRECT[name])
+    E_subj = {s: Xn[subj == s].mean(0) for s in np.unique(subj)}
+    return fit_emg_rel(Xn[tidx], Yn[tidx], subj[tidx], tm, E_subj, E_tm, REL[name])
 
 
 def onset_peak(v, frac=0.5):
@@ -410,7 +454,15 @@ def main():
             E_tm = Xn[tidx].mean(0)              # mean EMG envelope over the same trials (for emg_align)
             Yt_true = nz.y_inv(Yn[te])
             Ytmpl = np.repeat(nz.y_inv(tmpl_n), len(te), 0)
-            off = tmpl_n if a.residual else 0.0       # residual mode: learn Y - template
+            # what nets/ridge are trained on top of (per trial):
+            #   --base <emg timer>: the EMG-shifted template;  --residual: the template;  else nothing
+            if a.base:
+                bpred, _, _ = fit_timer(a.base, Xn, Yn, subj, tidx, tmpl_n[0], E_tm)
+                off = bpred(Xn, subj)[0]
+            elif a.residual:
+                off = np.repeat(tmpl_n, len(Yn), 0)
+            else:
+                off = np.zeros_like(Yn)
             Yfit = Yn - off
             for m in a.models:
                 if m not in NETS and seed != seeds_needed[0] and a.split == "loso":
@@ -421,15 +473,16 @@ def main():
                     Pn = np.repeat(tmpl_n, len(te), 0)
                 elif m in ORACLES:                   # CEILINGS, use the true signal (not models)
                     Pn = oracle_template(tmpl_n[0], Yn[te], *ORACLES[m])
-                elif m in ALIGN or m in DIRECT:      # EMG-timed template (<= 3 numbers per trial)
+                elif m in ALIGN or m in DIRECT or m in REL:   # EMG-timed template (<= 3 numbers per trial)
                     if m in ALIGN:
                         pred, r_tr, (al, w) = fit_emg_align(Xn[tr], Yn[tr], Xn[va], Yn[va], tmpl_n[0], E_tm,
                                                             *ALIGN[m])
                         msg = f"alpha {al}  blend w {w}"
+                        Pn, k_pred, lag_te = pred(Xn[te])
                     else:                            # calibration constant from the template trials
-                        pred, r_tr, c_s = fit_emg_direct(Xn[tidx], Yn[tidx], tmpl_n[0], E_tm, DIRECT[m])
+                        pred, r_tr, c_s = fit_timer(m, Xn, Yn, subj, tidx, tmpl_n[0], E_tm)
                         msg = f"offset {c_s:+.2f} s"
-                    Pn, k_pred, lag_te = pred(Xn[te])
+                        Pn, k_pred, lag_te = pred(Xn[te], subj[te])
                     print(f"    {m}: train corr(EMG lag, true shift) {r_tr:+.2f}  {msg}", flush=True)
                     k_true = np.array([fit_template(tmpl_n[0], y)[0] for y in Yn[te]])
                     shift_rows += [dict(model=m, seed=seed, fold=fold, test_subject=subj[i], trial=D["trial"][i],
@@ -437,10 +490,10 @@ def main():
                                    for i, kt, kp, lg in zip(te, k_true, k_pred, lag_te)]
                     pd.DataFrame(shift_rows).to_csv(out / "shifts.csv", index=False)
                 elif m == "ridge":
-                    Pn = fit_ridge(Xn[tr], Yfit[tr], Xn[va], Yfit[va])(Xn[te]) + off
+                    Pn = fit_ridge(Xn[tr], Yfit[tr], Xn[va], Yfit[va])(Xn[te]) + off[te]
                 else:
                     pred, ep, npar = train_net(m, Xn[tr], Yfit[tr], Xn[va], Yfit[va], seed, a, dev)
-                    Pn = pred(Xn[te]) + off
+                    Pn = pred(Xn[te]) + off[te]
                 P = nz.y_inv(Pn)
                 # per-subject scores (for random split, the test set mixes subjects)
                 for s in sorted(set(subj[te])):
@@ -451,7 +504,8 @@ def main():
                     row = dict(model=m, loss=a.loss if m in NETS else "-", seed=seed, fold=fold, test_subject=s,
                                n_trials=int(k.sum()), alignment=a.alignment, split=a.split, norm=a.norm,
                                target=a.target, channels=" ".join(map(str, a.channels)), epochs=ep,
-                               residual=int(a.residual and (m in NETS or m == "ridge")),
+                               residual=int(bool(a.residual or a.base) and (m in NETS or m == "ridge")),
+                               base=(a.base or "") if (m in NETS or m == "ridge") else "",
                                wd=a.wd if m in NETS else 0.0, shift_r=sh_r,
                                params=npar, secs=round(time.time() - t0, 1),
                                **metrics(Yt_true[k], P[k], Ytmpl[k]))

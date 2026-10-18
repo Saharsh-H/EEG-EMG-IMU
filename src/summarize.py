@@ -22,10 +22,12 @@ ap.add_argument("--out", default=None, help="optional path for summary csv")
 a = ap.parse_args()
 
 df = pd.concat([pd.read_csv(f) for f in a.csv], ignore_index=True)
-for c, d in [("residual", 0), ("wd", 0.0)]:
+for c, d in [("residual", 0), ("wd", 0.0), ("base", "")]:
     if c not in df:
         df[c] = d
-df["config"] = df["model"] + "|" + df["loss"].astype(str) + np.where(df["residual"] > 0, "|res", "") \
+df["base"] = df["base"].fillna("").astype(str)
+df["config"] = df["model"] + "|" + df["loss"].astype(str) \
+    + np.where(df["base"] != "", "|on:" + df["base"], np.where(df["residual"] > 0, "|res", "")) \
     + np.where(df["wd"] > 0, "|wd" + df["wd"].astype(str), "")
 keys = ["config", "alignment", "split", "norm", "target", "channels"]
 
