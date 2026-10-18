@@ -55,6 +55,9 @@ def get_args():
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--save_preds", action="store_true")
+    ap.add_argument("--residual", action="store_true",
+                    help="nets/ridge learn the deviation from the training template (template added back)")
+    ap.add_argument("--wd", type=float, default=0.0, help="Adam weight decay")
     return ap.parse_args()
 
 
@@ -133,7 +136,7 @@ def fit_ridge(Xtr, Ytr, Xva, Yva):
 def train_net(name, Xtr, Ytr, Xva, Yva, seed, a, dev):
     torch.manual_seed(seed); np.random.seed(seed)
     model = make_model(name, Xtr.shape[2]).to(dev)
-    opt = torch.optim.Adam(model.parameters(), lr=a.lr)
+    opt = torch.optim.Adam(model.parameters(), lr=a.lr, weight_decay=a.wd)
     loss_fn = LOSSES[a.loss]
     Xt, Yt = torch.tensor(Xtr, device=dev), torch.tensor(Ytr, device=dev)
     Xv, Yv = torch.tensor(Xva, device=dev), torch.tensor(Yva, device=dev)
@@ -205,6 +208,8 @@ def main():
             tmpl_n = Yn[tr].mean(0, keepdims=True)
             Yt_true = nz.y_inv(Yn[te])
             Ytmpl = np.repeat(nz.y_inv(tmpl_n), len(te), 0)
+            off = tmpl_n if a.residual else 0.0       # residual mode: learn Y - template
+            Yfit = Yn - off
             for m in a.models:
                 if m not in NETS and seed != seeds_needed[0] and a.split == "loso":
                     continue                     # template / ridge are deterministic
@@ -212,10 +217,10 @@ def main():
                 if m == "template":
                     Pn = np.repeat(tmpl_n, len(te), 0)
                 elif m == "ridge":
-                    Pn = fit_ridge(Xn[tr], Yn[tr], Xn[va], Yn[va])(Xn[te])
+                    Pn = fit_ridge(Xn[tr], Yfit[tr], Xn[va], Yfit[va])(Xn[te]) + off
                 else:
-                    pred, ep, npar = train_net(m, Xn[tr], Yn[tr], Xn[va], Yn[va], seed, a, dev)
-                    Pn = pred(Xn[te])
+                    pred, ep, npar = train_net(m, Xn[tr], Yfit[tr], Xn[va], Yfit[va], seed, a, dev)
+                    Pn = pred(Xn[te]) + off
                 P = nz.y_inv(Pn)
                 # per-subject scores (for random split, the test set mixes subjects)
                 for s in sorted(set(subj[te])):
@@ -223,6 +228,7 @@ def main():
                     row = dict(model=m, loss=a.loss if m in NETS else "-", seed=seed, fold=fold, test_subject=s,
                                n_trials=int(k.sum()), alignment=a.alignment, split=a.split, norm=a.norm,
                                target=a.target, channels=" ".join(map(str, a.channels)), epochs=ep,
+                               residual=int(a.residual and m != "template"), wd=a.wd,
                                params=npar, secs=round(time.time() - t0, 1),
                                **metrics(Yt_true[k], P[k], Ytmpl[k]))
                     rows.append(row)

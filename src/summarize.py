@@ -17,13 +17,21 @@ from scipy.stats import wilcoxon
 ap = argparse.ArgumentParser()
 ap.add_argument("csv", nargs="+")
 ap.add_argument("--ref", default="cnn_lstm|composite", help="reference config 'model|loss'")
+ap.add_argument("--per_subject", action="store_true", help="also print skill per test subject")
 ap.add_argument("--out", default=None, help="optional path for summary csv")
 a = ap.parse_args()
 
 df = pd.concat([pd.read_csv(f) for f in a.csv], ignore_index=True)
-df["config"] = df["model"] + "|" + df["loss"].astype(str)
+for c, d in [("residual", 0), ("wd", 0.0)]:
+    if c not in df:
+        df[c] = d
+df["config"] = df["model"] + "|" + df["loss"].astype(str) + np.where(df["residual"] > 0, "|res", "") \
+    + np.where(df["wd"] > 0, "|wd" + df["wd"].astype(str), "")
 keys = ["config", "alignment", "split", "norm", "target", "channels"]
 
+if a.per_subject:
+    ps = df.groupby(["config", "test_subject"])["skill"].mean().unstack(0).round(3)
+    print(ps.to_string(), "\n")
 per_subj = df.groupby(keys + ["test_subject"])[["r2", "rmse", "pearson", "skill"]].mean().reset_index()
 rows = []
 for k, g in per_subj.groupby(keys):
