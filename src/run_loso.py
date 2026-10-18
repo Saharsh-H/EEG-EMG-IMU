@@ -208,9 +208,28 @@ def emg_lag(E_tm, x):
     return best[1]
 
 
-def align_features(E_tm, X):
-    """Per-trial EMG features: EMG timing lag (s) + per-channel mean and peak envelope."""
-    return np.array([np.concatenate([[emg_lag(E_tm, x) / FS], x.mean(0), x.max(0)]) for x in X])
+def onset_peak(v, frac=0.5):
+    """Onset time (first crossing of baseline + frac*(peak-baseline)) and peak time, in s."""
+    base, pk = np.percentile(v, 10), int(np.argmax(v))
+    above = np.where(v >= base + frac * (v[pk] - base))[0]
+    return (above[0] if len(above) else pk) / FS, pk / FS
+
+
+def align_features(E_tm, X, feats="all"):
+    """Per-trial EMG features. Column 0 is always the EMG lag (s).
+      all     lag + per-channel mean and peak envelope (17)
+      lag     lag only (1)
+      timing  lag + onset/peak time of each channel and of the channel sum (19)"""
+    out = []
+    for x in X:
+        f = [emg_lag(E_tm, x) / FS]
+        if feats == "all":
+            f += list(x.mean(0)) + list(x.max(0))
+        elif feats == "timing":
+            for v in list(x.T) + [x.sum(1)]:
+                f += list(onset_peak(v))
+        out.append(f)
+    return np.array(out)
 
 
 # variants of the EMG-timed template: (features, predicted parameters, blend with template)
@@ -218,8 +237,10 @@ def align_features(E_tm, X):
 #   emg_align_b  same, output blended with the plain template (weight w chosen on validation)
 #   emg_shift    EMG lag only    -> shift only (scale 1, offset 0)
 #   emg_shift_b  same, blended
+#   emg_time     EMG lag + per-channel onset/peak times -> shift only
 ALIGN = {"emg_align": ("all", "kab", False), "emg_align_b": ("all", "kab", True),
-         "emg_shift": ("lag", "k", False), "emg_shift_b": ("lag", "k", True)}
+         "emg_shift": ("lag", "k", False), "emg_shift_b": ("lag", "k", True),
+         "emg_time": ("timing", "k", False)}
 
 
 def fit_emg_align(Xtr, Ytr, Xva, Yva, tm, E_tm, feats="all", params="kab", blend=False):
@@ -228,9 +249,7 @@ def fit_emg_align(Xtr, Ytr, Xva, Yva, tm, E_tm, feats="all", params="kab", blend
     blend: final = w*warped + (1-w)*template, hedging against wrong shift guesses.
     Ridge alpha (and w) are chosen on the validation subject's reconstruction error.
     Returns predict(X) -> (Y_pred, k_pred), training corr(EMG lag, true shift), chosen (alpha, w)."""
-    Ftr, Fva = align_features(E_tm, Xtr), align_features(E_tm, Xva)
-    if feats == "lag":
-        Ftr, Fva = Ftr[:, :1], Fva[:, :1]
+    Ftr, Fva = align_features(E_tm, Xtr, feats), align_features(E_tm, Xva, feats)
     if params == "kab":
         P = np.array([fit_template(tm, y) for y in Ytr])                       # true (k, a, b)
     else:
@@ -256,9 +275,10 @@ def fit_emg_align(Xtr, Ytr, Xva, Yva, tm, E_tm, feats="all", params="kab", blend
     r_lag = float(np.corrcoef(Ftr[:, 0], P[:, 0])[0, 1])
 
     def predict(X):
-        prm = params_of(ms, align_features(E_tm, X)[:, :Ftr.shape[1]])
+        F = align_features(E_tm, X, feats)
+        prm = params_of(ms, F)
         Yw = np.array([warp(tm, *p) for p in prm])
-        return (w * Yw + (1 - w) * tm).astype(np.float32), prm[:, 0]
+        return (w * Yw + (1 - w) * tm).astype(np.float32), prm[:, 0], F[:, 0]
     return predict, r_lag, (al, w)
 
 
@@ -328,6 +348,7 @@ def main():
     subj = D["subj"]
 
     rows, csv = [], out / "results.csv"
+    shift_rows = []                          # per-trial true/predicted shifts for emg_* models
     seeds_needed = a.seeds if (a.split == "random" or any(m in NETS for m in a.models)) else a.seeds[:1]
     for seed in seeds_needed:
         for fold, tr, va, te in make_folds(subj, a.split, seed):
@@ -356,8 +377,12 @@ def main():
                 elif m in ALIGN:                     # EMG-timed template (<= 3 numbers per trial)
                     pred, r_tr, (al, w) = fit_emg_align(Xn[tr], Yn[tr], Xn[va], Yn[va], tmpl_n[0], E_tm,
                                                         *ALIGN[m])
-                    Pn, k_pred = pred(Xn[te])
+                    Pn, k_pred, lag_te = pred(Xn[te])
                     k_true = np.array([fit_template(tmpl_n[0], y)[0] for y in Yn[te]])
+                    shift_rows += [dict(model=m, seed=seed, fold=fold, test_subject=subj[i], trial=D["trial"][i],
+                                        k_true_s=kt / FS, k_pred_s=kp / FS, emg_lag_s=lg)
+                                   for i, kt, kp, lg in zip(te, k_true, k_pred, lag_te)]
+                    pd.DataFrame(shift_rows).to_csv(out / "shifts.csv", index=False)
                     print(f"    {m}: train corr(EMG lag, true shift) {r_tr:+.2f}  alpha {al}  blend w {w}",
                           flush=True)
                 elif m == "ridge":
