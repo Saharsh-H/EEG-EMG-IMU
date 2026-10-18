@@ -28,6 +28,9 @@ Non-network models:
   emg_align     EMG-timed template: EMG features -> per-trial shift, scale, offset of the template
   emg_align_b   same, blended with the plain template (weight chosen on validation)
   emg_shift     EMG lag only -> shift only;  emg_shift_b  same, blended
+  emg_direct    shift = EMG lag + constant (no slope fitted); _sum: lag of total EMG activity
+                (armband-rotation insensitive); _rot: lag searching 8 channel rotations.
+                With --split within the constant comes from the test subject's own trials (calibration).
 """
 import argparse
 import time
@@ -195,17 +198,61 @@ def oracle_template(tm, Yte, shift=True, scale=True):
     return np.array([warp(tm, *fit_template(tm, y, shift, scale)) for y in Yte], dtype=np.float32)
 
 
-def emg_lag(E_tm, x):
-    """Shift (samples) of the mean training EMG envelope E_tm (T,C) that best matches trial x (T,C)."""
-    xc = (x - x.mean(0)).ravel()
+_SHIFT_CACHE = {}
+
+
+def _shifted_bank(E):
+    """All shifted, centred, unit-norm copies of E (T,C) -> (n_shifts, T*C), cached per array."""
+    key = (id(E), E.shape, float(E.sum()))
+    if key not in _SHIFT_CACHE:
+        _SHIFT_CACHE.clear()
+        S = []
+        for k in range(-MAX_SHIFT, MAX_SHIFT + 1):
+            s = shift_sig(E, k)
+            s = (s - s.mean(0)).ravel()
+            S.append(s / (np.linalg.norm(s) + 1e-8))
+        _SHIFT_CACHE[key] = np.array(S)
+    return _SHIFT_CACHE[key]
+
+
+def emg_lag(E_tm, x, mode="ch"):
+    """Shift (samples, k>0 = trial is later) of the mean training EMG envelope E_tm (T,C)
+    that best correlates with trial x (T,C).
+      ch   all 8 channels as they are
+      sum  total activity (sum over channels): insensitive to armband rotation
+      rot  8 channels, also searching the 8 circular channel rotations of the trial"""
+    if mode == "sum":
+        E_tm, x = E_tm.sum(1, keepdims=True), x.sum(1, keepdims=True)
+    S = _shifted_bank(E_tm)
+    rots = range(x.shape[1]) if mode == "rot" else [0]
     best = None
-    for k in range(-MAX_SHIFT, MAX_SHIFT + 1):
-        s = shift_sig(E_tm, k)
-        s = (s - s.mean(0)).ravel()
-        c = float(s @ xc) / (np.linalg.norm(s) * np.linalg.norm(xc) + 1e-8)
-        if best is None or c > best[0]:
-            best = (c, k)
+    for r in rots:
+        xr = np.roll(x, r, axis=1)
+        xc = (xr - xr.mean(0)).ravel()
+        c = S @ xc / (np.linalg.norm(xc) + 1e-8)
+        i = int(np.argmax(c))
+        if best is None or c[i] > best[0]:
+            best = (c[i], i - MAX_SHIFT)
     return best[1]
+
+
+# "slope-1" EMG-timed template: shift = EMG lag + one constant (median over calibration trials).
+# No regression slope. Under --split loso the constant comes from the training subjects;
+# under --split within it comes from the test subject's own training trials (= calibration).
+DIRECT = {"emg_direct": "ch", "emg_direct_sum": "sum", "emg_direct_rot": "rot"}
+
+
+def fit_emg_direct(Xcal, Ycal, tm, E_tm, mode):
+    lag = np.array([emg_lag(E_tm, x, mode) for x in Xcal])
+    k_true = np.array([fit_template(tm, y, scale=False)[0] for y in Ycal])
+    c = float(np.median(k_true - lag))
+    r = float(np.corrcoef(lag, k_true)[0, 1]) if np.std(lag) > 0 else np.nan
+
+    def predict(X):
+        lg = np.array([emg_lag(E_tm, x, mode) for x in X])
+        k = np.clip(lg + c, -MAX_SHIFT, MAX_SHIFT)
+        return np.array([warp(tm, kk, 1.0, 0.0) for kk in k], dtype=np.float32), k, lg / FS
+    return predict, r, c / FS
 
 
 def onset_peak(v, frac=0.5):
@@ -374,17 +421,21 @@ def main():
                     Pn = np.repeat(tmpl_n, len(te), 0)
                 elif m in ORACLES:                   # CEILINGS, use the true signal (not models)
                     Pn = oracle_template(tmpl_n[0], Yn[te], *ORACLES[m])
-                elif m in ALIGN:                     # EMG-timed template (<= 3 numbers per trial)
-                    pred, r_tr, (al, w) = fit_emg_align(Xn[tr], Yn[tr], Xn[va], Yn[va], tmpl_n[0], E_tm,
-                                                        *ALIGN[m])
+                elif m in ALIGN or m in DIRECT:      # EMG-timed template (<= 3 numbers per trial)
+                    if m in ALIGN:
+                        pred, r_tr, (al, w) = fit_emg_align(Xn[tr], Yn[tr], Xn[va], Yn[va], tmpl_n[0], E_tm,
+                                                            *ALIGN[m])
+                        msg = f"alpha {al}  blend w {w}"
+                    else:                            # calibration constant from the template trials
+                        pred, r_tr, c_s = fit_emg_direct(Xn[tidx], Yn[tidx], tmpl_n[0], E_tm, DIRECT[m])
+                        msg = f"offset {c_s:+.2f} s"
                     Pn, k_pred, lag_te = pred(Xn[te])
+                    print(f"    {m}: train corr(EMG lag, true shift) {r_tr:+.2f}  {msg}", flush=True)
                     k_true = np.array([fit_template(tmpl_n[0], y)[0] for y in Yn[te]])
                     shift_rows += [dict(model=m, seed=seed, fold=fold, test_subject=subj[i], trial=D["trial"][i],
                                         k_true_s=kt / FS, k_pred_s=kp / FS, emg_lag_s=lg)
                                    for i, kt, kp, lg in zip(te, k_true, k_pred, lag_te)]
                     pd.DataFrame(shift_rows).to_csv(out / "shifts.csv", index=False)
-                    print(f"    {m}: train corr(EMG lag, true shift) {r_tr:+.2f}  alpha {al}  blend w {w}",
-                          flush=True)
                 elif m == "ridge":
                     Pn = fit_ridge(Xn[tr], Yfit[tr], Xn[va], Yfit[va])(Xn[te]) + off
                 else:
