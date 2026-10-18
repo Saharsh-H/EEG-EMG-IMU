@@ -26,6 +26,8 @@ Non-network models:
   oracle*       CEILINGS that use the true test signal (best shift/scale of the template)
   ridge         lagged-EMG linear regression
   emg_align     EMG-timed template: EMG features -> per-trial shift, scale, offset of the template
+  emg_align_b   same, blended with the plain template (weight chosen on validation)
+  emg_shift     EMG lag only -> shift only;  emg_shift_b  same, blended
 """
 import argparse
 import time
@@ -211,30 +213,53 @@ def align_features(E_tm, X):
     return np.array([np.concatenate([[emg_lag(E_tm, x) / FS], x.mean(0), x.max(0)]) for x in X])
 
 
-def fit_emg_align(Xtr, Ytr, Xva, Yva, tm, E_tm):
-    """EMG-timed template: predict each trial's shift k, scale a, offset b from EMG features
-    (ridge, alpha chosen on validation reconstruction error) and warp the average movement.
-    Returns predict(X) -> (Y_pred, k_pred) and the training (true-k, EMG-lag) correlation."""
+# variants of the EMG-timed template: (features, predicted parameters, blend with template)
+#   emg_align    all 17 features -> shift, scale, offset
+#   emg_align_b  same, output blended with the plain template (weight w chosen on validation)
+#   emg_shift    EMG lag only    -> shift only (scale 1, offset 0)
+#   emg_shift_b  same, blended
+ALIGN = {"emg_align": ("all", "kab", False), "emg_align_b": ("all", "kab", True),
+         "emg_shift": ("lag", "k", False), "emg_shift_b": ("lag", "k", True)}
+
+
+def fit_emg_align(Xtr, Ytr, Xva, Yva, tm, E_tm, feats="all", params="kab", blend=False):
+    """EMG-timed template: predict each trial's shift k (and optionally scale a, offset b) from
+    EMG features with ridge regression, then warp the average movement accordingly.
+    blend: final = w*warped + (1-w)*template, hedging against wrong shift guesses.
+    Ridge alpha (and w) are chosen on the validation subject's reconstruction error.
+    Returns predict(X) -> (Y_pred, k_pred), training corr(EMG lag, true shift), chosen (alpha, w)."""
     Ftr, Fva = align_features(E_tm, Xtr), align_features(E_tm, Xva)
-    P = np.array([fit_template(tm, y) for y in Ytr])               # true (k, a, b) per train trial
+    if feats == "lag":
+        Ftr, Fva = Ftr[:, :1], Fva[:, :1]
+    if params == "kab":
+        P = np.array([fit_template(tm, y) for y in Ytr])                       # true (k, a, b)
+    else:
+        P = np.array([fit_template(tm, y, scale=False)[:1] for y in Ytr])      # true k only
     mu, sd = Ftr.mean(0), Ftr.std(0) + 1e-8
+
+    def params_of(ms, F):
+        prm = np.stack([m.predict((F - mu) / sd) for m in ms], 1)
+        prm[:, 0] = np.clip(prm[:, 0], -MAX_SHIFT, MAX_SHIFT)
+        if prm.shape[1] == 1:                                                  # shift only
+            prm = np.concatenate([prm, np.ones((len(prm), 1)), np.zeros((len(prm), 1))], 1)
+        return prm
+
     best = None
     for al in [0.1, 1, 10, 100, 1000]:
-        ms = [Ridge(alpha=al).fit((Ftr - mu) / sd, P[:, j]) for j in range(3)]
-        prm = np.stack([m.predict((Fva - mu) / sd) for m in ms], 1)
-        Yp = np.array([warp(tm, *p) for p in prm])
-        err = np.mean((Yp - Yva) ** 2)
-        if best is None or err < best[0]:
-            best = (err, ms)
-    ms = best[1]
+        ms = [Ridge(alpha=al).fit((Ftr - mu) / sd, P[:, j]) for j in range(P.shape[1])]
+        Yw = np.array([warp(tm, *p) for p in params_of(ms, Fva)])
+        for w in ([0.0, 0.25, 0.5, 0.75, 1.0] if blend else [1.0]):
+            err = np.mean((w * Yw + (1 - w) * tm - Yva) ** 2)
+            if best is None or err < best[0]:
+                best = (err, ms, al, w)
+    _, ms, al, w = best
     r_lag = float(np.corrcoef(Ftr[:, 0], P[:, 0])[0, 1])
 
     def predict(X):
-        F = align_features(E_tm, X)
-        prm = np.stack([m.predict((F - mu) / sd) for m in ms], 1)
-        prm[:, 0] = np.clip(prm[:, 0], -MAX_SHIFT, MAX_SHIFT)
-        return np.array([warp(tm, *p) for p in prm], dtype=np.float32), prm[:, 0]
-    return predict, r_lag
+        prm = params_of(ms, align_features(E_tm, X)[:, :Ftr.shape[1]])
+        Yw = np.array([warp(tm, *p) for p in prm])
+        return (w * Yw + (1 - w) * tm).astype(np.float32), prm[:, 0]
+    return predict, r_lag, (al, w)
 
 
 def train_net(name, Xtr, Ytr, Xva, Yva, seed, a, dev):
@@ -328,11 +353,13 @@ def main():
                     Pn = np.repeat(tmpl_n, len(te), 0)
                 elif m in ORACLES:                   # CEILINGS, use the true signal (not models)
                     Pn = oracle_template(tmpl_n[0], Yn[te], *ORACLES[m])
-                elif m == "emg_align":               # EMG-timed template (3 numbers per trial)
-                    pred, r_tr = fit_emg_align(Xn[tr], Yn[tr], Xn[va], Yn[va], tmpl_n[0], E_tm)
+                elif m in ALIGN:                     # EMG-timed template (<= 3 numbers per trial)
+                    pred, r_tr, (al, w) = fit_emg_align(Xn[tr], Yn[tr], Xn[va], Yn[va], tmpl_n[0], E_tm,
+                                                        *ALIGN[m])
                     Pn, k_pred = pred(Xn[te])
                     k_true = np.array([fit_template(tmpl_n[0], y)[0] for y in Yn[te]])
-                    print(f"    emg_align: train corr(EMG lag, true shift) {r_tr:+.2f}", flush=True)
+                    print(f"    {m}: train corr(EMG lag, true shift) {r_tr:+.2f}  alpha {al}  blend w {w}",
+                          flush=True)
                 elif m == "ridge":
                     Pn = fit_ridge(Xn[tr], Yfit[tr], Xn[va], Yfit[va])(Xn[te]) + off
                 else:
