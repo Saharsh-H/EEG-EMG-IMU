@@ -1,0 +1,2 @@
+channels,num_channels,mse,r2,pearson,epochs
+"['EMG_2', 'EMG_3', 'EMG_5', 'EMG_7']",4,0.1554,0.8446,0.9199,180
