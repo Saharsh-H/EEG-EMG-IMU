@@ -47,7 +47,8 @@ def get_args():
     ap.add_argument("--channels", nargs="+", type=int, default=list(range(1, 9)), help="1-based EMG channels")
     ap.add_argument("--alignment", default="absolute", choices=["absolute", "paper_v1"])
     ap.add_argument("--shift", type=float, default=0.0)
-    ap.add_argument("--split", default="loso", choices=["loso", "random"])
+    ap.add_argument("--split", default="loso", choices=["loso", "random", "within"],
+                    help="within: 5-fold over the test subject's own trials; training = other subjects + its other folds")
     ap.add_argument("--norm", default="deploy", choices=["deploy", "per_trial"])
     ap.add_argument("--epochs", type=int, default=150)
     ap.add_argument("--patience", type=int, default=25)
@@ -70,6 +71,15 @@ def make_folds(subj, split, seed):
         for i, s in enumerate(subjects):
             v = subjects[(i + 1) % len(subjects)]
             yield s, idx[(subj != s) & (subj != v)], idx[subj == v], idx[subj == s]
+    elif split == "within":
+        rng = np.random.RandomState(100 + seed)
+        for s in subjects:
+            own = rng.permutation(idx[subj == s])
+            parts = np.array_split(own, 5)
+            for k in range(5):
+                te, va = parts[k], parts[(k + 1) % 5]
+                tr = np.concatenate([idx[subj != s]] + [parts[j] for j in range(5) if j not in (k, (k + 1) % 5)])
+                yield f"{s}_k{k}", tr, va, te
     else:  # random trial-level 80/20 (the paper's protocol); 10% of train held out for validation
         rng = np.random.RandomState(42 + seed)
         p = rng.permutation(idx)
@@ -131,6 +141,26 @@ def fit_ridge(Xtr, Ytr, Xva, Yva):
         F = lag_features(X)
         return model.predict(F.reshape(-1, F.shape[2])).reshape(X.shape[:2])
     return predict
+
+
+def oracle_template(tm, Yte, max_shift_s=1.0):
+    """Upper bound for 'EMG tells us when and how big': per test trial, the template shifted
+    (+-1 s) and scaled/offset by least squares to fit the TRUE signal. Not a real model."""
+    T, out = len(tm), []
+    for y in Yte:
+        best = None
+        for k in range(-int(max_shift_s * FS), int(max_shift_s * FS) + 1):
+            sh = np.roll(tm, k)
+            if k > 0: sh[:k] = tm[0]
+            elif k < 0: sh[k:] = tm[-1]
+            A = np.stack([sh, np.ones(T)], 1)
+            coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+            fit = A @ coef
+            err = ((fit - y) ** 2).sum()
+            if best is None or err < best[0]:
+                best = (err, fit)
+        out.append(best[1])
+    return np.array(out, dtype=np.float32)
 
 
 def train_net(name, Xtr, Ytr, Xva, Yva, seed, a, dev):
@@ -205,7 +235,11 @@ def main():
             nz = Norm(a.norm, X, Y, subj, tr)
             Xn = nz.x(X, subj).astype(np.float32)
             Yn = nz.y(Y).astype(np.float32)
-            tmpl_n = Yn[tr].mean(0, keepdims=True)
+            if a.split == "within":              # subject-specific template from its own training trials
+                own = tr[subj[tr] == subj[te][0]]
+                tmpl_n = Yn[own].mean(0, keepdims=True)
+            else:
+                tmpl_n = Yn[tr].mean(0, keepdims=True)
             Yt_true = nz.y_inv(Yn[te])
             Ytmpl = np.repeat(nz.y_inv(tmpl_n), len(te), 0)
             off = tmpl_n if a.residual else 0.0       # residual mode: learn Y - template
@@ -216,6 +250,8 @@ def main():
                 t0 = time.time(); ep, npar = 0, 0
                 if m == "template":
                     Pn = np.repeat(tmpl_n, len(te), 0)
+                elif m == "oracle":                  # CEILING, uses the true signal: best shift+scale of template
+                    Pn = oracle_template(tmpl_n[0], Yn[te])
                 elif m == "ridge":
                     Pn = fit_ridge(Xn[tr], Yfit[tr], Xn[va], Yfit[va])(Xn[te]) + off
                 else:
