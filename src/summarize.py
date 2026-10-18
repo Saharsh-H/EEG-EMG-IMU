@@ -32,12 +32,13 @@ keys = ["config", "alignment", "split", "norm", "target", "channels"]
 if a.per_subject:
     ps = df.groupby(["config", "test_subject"])["skill"].mean().unstack(0).round(3)
     print(ps.to_string(), "\n")
-per_subj = df.groupby(keys + ["test_subject"])[["r2", "rmse", "pearson", "skill"]].mean().reset_index()
+mets = ["r2", "rmse", "pearson", "skill"] + (["shift_r"] if "shift_r" in df and df["shift_r"].notna().any() else [])
+per_subj = df.groupby(keys + ["test_subject"])[mets].mean().reset_index()
 rows = []
 for k, g in per_subj.groupby(keys):
     row = dict(zip(keys, k), n_subj=len(g))
-    for m in ["r2", "rmse", "pearson", "skill"]:
-        row[m] = f"{g[m].mean():.3f} ± {g[m].std():.3f}"
+    for m in mets:
+        row[m] = f"{g[m].mean():.3f} ± {g[m].std():.3f}" if g[m].notna().any() else "-"
     ref = per_subj[(per_subj["config"] == a.ref) & np.all([per_subj[c] == v for c, v in zip(keys[1:], k[1:])], 0)]
     if len(ref) and k[0] != a.ref:
         mrg = g.merge(ref, on="test_subject", suffixes=("", "_ref"))

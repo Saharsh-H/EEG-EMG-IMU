@@ -19,6 +19,13 @@ Examples (from the repo root):
   python src/run_loso.py --models cnn_lstm --loss mse --out results/mse
   python src/run_loso.py --alignment paper_v1 --split random --norm per_trial \
          --models template cnn_lstm --fixed_epochs 180 --out results/paper_protocol
+  python src/run_loso.py --models template oracle oracle_shift oracle_scale emg_align --out results/align
+
+Non-network models:
+  template      average training movement (no EMG)
+  oracle*       CEILINGS that use the true test signal (best shift/scale of the template)
+  ridge         lagged-EMG linear regression
+  emg_align     EMG-timed template: EMG features -> per-trial shift, scale, offset of the template
 """
 import argparse
 import time
@@ -33,6 +40,7 @@ from data import build_dataset, TARGETS, FS
 from models import make_model, LOSSES
 
 NETS = {"cnn_lstm", "cnn", "lstm", "cnn_tcn"}
+ORACLES = {"oracle": (True, True), "oracle_shift": (True, False), "oracle_scale": (False, True)}
 
 
 def get_args():
@@ -143,24 +151,90 @@ def fit_ridge(Xtr, Ytr, Xva, Yva):
     return predict
 
 
-def oracle_template(tm, Yte, max_shift_s=1.0):
-    """Upper bound for 'EMG tells us when and how big': per test trial, the template shifted
-    (+-1 s) and scaled/offset by least squares to fit the TRUE signal. Not a real model."""
-    T, out = len(tm), []
-    for y in Yte:
-        best = None
-        for k in range(-int(max_shift_s * FS), int(max_shift_s * FS) + 1):
-            sh = np.roll(tm, k)
-            if k > 0: sh[:k] = tm[0]
-            elif k < 0: sh[k:] = tm[-1]
+MAX_SHIFT = int(round(1.0 * FS))        # +-1 s search range for time shifts (samples)
+
+
+def shift_sig(v, k):
+    """Delay v (T,) or (T,C) by k samples (k>0: later), padding with the edge value."""
+    out = np.roll(v, k, axis=0)
+    if k > 0:
+        out[:k] = v[0]
+    elif k < 0:
+        out[k:] = v[-1]
+    return out
+
+
+def fit_template(tm, y, shift=True, scale=True):
+    """Best (k, a, b) so that a*shift(tm,k)+b fits y by least squares. Returns (k, a, b)."""
+    T, best = len(tm), None
+    for k in (range(-MAX_SHIFT, MAX_SHIFT + 1) if shift else [0]):
+        sh = shift_sig(tm, k)
+        if scale:
             A = np.stack([sh, np.ones(T)], 1)
-            coef, *_ = np.linalg.lstsq(A, y, rcond=None)
-            fit = A @ coef
-            err = ((fit - y) ** 2).sum()
-            if best is None or err < best[0]:
-                best = (err, fit)
-        out.append(best[1])
-    return np.array(out, dtype=np.float32)
+            (a_, b_), *_ = np.linalg.lstsq(A, y, rcond=None)
+        else:
+            a_, b_ = 1.0, float(np.mean(y - sh))
+        err = ((a_ * sh + b_ - y) ** 2).sum()
+        if best is None or err < best[0]:
+            best = (err, k, a_, b_)
+    return best[1:]
+
+
+def warp(tm, k, a, b):
+    return a * shift_sig(tm, int(round(k))) + b
+
+
+def oracle_template(tm, Yte, shift=True, scale=True):
+    """CEILING, uses the TRUE signal (not a model): per test trial, the template shifted
+    (+-1 s) and/or scaled+offset by least squares to fit the truth.
+      oracle        shift + scale + offset
+      oracle_shift  shift + offset only (timing)
+      oracle_scale  scale + offset only (amplitude, no timing)"""
+    return np.array([warp(tm, *fit_template(tm, y, shift, scale)) for y in Yte], dtype=np.float32)
+
+
+def emg_lag(E_tm, x):
+    """Shift (samples) of the mean training EMG envelope E_tm (T,C) that best matches trial x (T,C)."""
+    xc = (x - x.mean(0)).ravel()
+    best = None
+    for k in range(-MAX_SHIFT, MAX_SHIFT + 1):
+        s = shift_sig(E_tm, k)
+        s = (s - s.mean(0)).ravel()
+        c = float(s @ xc) / (np.linalg.norm(s) * np.linalg.norm(xc) + 1e-8)
+        if best is None or c > best[0]:
+            best = (c, k)
+    return best[1]
+
+
+def align_features(E_tm, X):
+    """Per-trial EMG features: EMG timing lag (s) + per-channel mean and peak envelope."""
+    return np.array([np.concatenate([[emg_lag(E_tm, x) / FS], x.mean(0), x.max(0)]) for x in X])
+
+
+def fit_emg_align(Xtr, Ytr, Xva, Yva, tm, E_tm):
+    """EMG-timed template: predict each trial's shift k, scale a, offset b from EMG features
+    (ridge, alpha chosen on validation reconstruction error) and warp the average movement.
+    Returns predict(X) -> (Y_pred, k_pred) and the training (true-k, EMG-lag) correlation."""
+    Ftr, Fva = align_features(E_tm, Xtr), align_features(E_tm, Xva)
+    P = np.array([fit_template(tm, y) for y in Ytr])               # true (k, a, b) per train trial
+    mu, sd = Ftr.mean(0), Ftr.std(0) + 1e-8
+    best = None
+    for al in [0.1, 1, 10, 100, 1000]:
+        ms = [Ridge(alpha=al).fit((Ftr - mu) / sd, P[:, j]) for j in range(3)]
+        prm = np.stack([m.predict((Fva - mu) / sd) for m in ms], 1)
+        Yp = np.array([warp(tm, *p) for p in prm])
+        err = np.mean((Yp - Yva) ** 2)
+        if best is None or err < best[0]:
+            best = (err, ms)
+    ms = best[1]
+    r_lag = float(np.corrcoef(Ftr[:, 0], P[:, 0])[0, 1])
+
+    def predict(X):
+        F = align_features(E_tm, X)
+        prm = np.stack([m.predict((F - mu) / sd) for m in ms], 1)
+        prm[:, 0] = np.clip(prm[:, 0], -MAX_SHIFT, MAX_SHIFT)
+        return np.array([warp(tm, *p) for p in prm], dtype=np.float32), prm[:, 0]
+    return predict, r_lag
 
 
 def train_net(name, Xtr, Ytr, Xva, Yva, seed, a, dev):
@@ -236,10 +310,11 @@ def main():
             Xn = nz.x(X, subj).astype(np.float32)
             Yn = nz.y(Y).astype(np.float32)
             if a.split == "within":              # subject-specific template from its own training trials
-                own = tr[subj[tr] == subj[te][0]]
-                tmpl_n = Yn[own].mean(0, keepdims=True)
+                tidx = tr[subj[tr] == subj[te][0]]
             else:
-                tmpl_n = Yn[tr].mean(0, keepdims=True)
+                tidx = tr
+            tmpl_n = Yn[tidx].mean(0, keepdims=True)
+            E_tm = Xn[tidx].mean(0)              # mean EMG envelope over the same trials (for emg_align)
             Yt_true = nz.y_inv(Yn[te])
             Ytmpl = np.repeat(nz.y_inv(tmpl_n), len(te), 0)
             off = tmpl_n if a.residual else 0.0       # residual mode: learn Y - template
@@ -248,10 +323,16 @@ def main():
                 if m not in NETS and seed != seeds_needed[0] and a.split == "loso":
                     continue                     # template / ridge are deterministic
                 t0 = time.time(); ep, npar = 0, 0
+                k_pred = k_true = None
                 if m == "template":
                     Pn = np.repeat(tmpl_n, len(te), 0)
-                elif m == "oracle":                  # CEILING, uses the true signal: best shift+scale of template
-                    Pn = oracle_template(tmpl_n[0], Yn[te])
+                elif m in ORACLES:                   # CEILINGS, use the true signal (not models)
+                    Pn = oracle_template(tmpl_n[0], Yn[te], *ORACLES[m])
+                elif m == "emg_align":               # EMG-timed template (3 numbers per trial)
+                    pred, r_tr = fit_emg_align(Xn[tr], Yn[tr], Xn[va], Yn[va], tmpl_n[0], E_tm)
+                    Pn, k_pred = pred(Xn[te])
+                    k_true = np.array([fit_template(tmpl_n[0], y)[0] for y in Yn[te]])
+                    print(f"    emg_align: train corr(EMG lag, true shift) {r_tr:+.2f}", flush=True)
                 elif m == "ridge":
                     Pn = fit_ridge(Xn[tr], Yfit[tr], Xn[va], Yfit[va])(Xn[te]) + off
                 else:
@@ -261,10 +342,14 @@ def main():
                 # per-subject scores (for random split, the test set mixes subjects)
                 for s in sorted(set(subj[te])):
                     k = subj[te] == s
+                    # how well the predicted time shift tracks the true one (emg_align only)
+                    sh_r = (float(np.corrcoef(k_pred[k], k_true[k])[0, 1])
+                            if k_pred is not None and k.sum() > 2 and np.std(k_true[k]) > 0 else np.nan)
                     row = dict(model=m, loss=a.loss if m in NETS else "-", seed=seed, fold=fold, test_subject=s,
                                n_trials=int(k.sum()), alignment=a.alignment, split=a.split, norm=a.norm,
                                target=a.target, channels=" ".join(map(str, a.channels)), epochs=ep,
-                               residual=int(a.residual and m != "template"), wd=a.wd,
+                               residual=int(a.residual and (m in NETS or m == "ridge")),
+                               wd=a.wd if m in NETS else 0.0, shift_r=sh_r,
                                params=npar, secs=round(time.time() - t0, 1),
                                **metrics(Yt_true[k], P[k], Ytmpl[k]))
                     rows.append(row)
