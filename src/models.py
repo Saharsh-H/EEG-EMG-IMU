@@ -6,6 +6,8 @@ models.py — sequence-to-sequence models (one output per time step) and losses.
   lstm     : ablation, LSTM only              2-layer LSTM(256) -> Linear
   cnn_tcn  : Saharsh's CNN-TCN, adapted to output every time step
              (original paper_v1/cnn_tcn predicted only the last sample of a window)
+  bilstm   : conv block -> 2-layer BIDIRECTIONAL LSTM(128) -> Linear (offline, whole-trial context)
+  cnn_lstm_s : small CNN-LSTM (1-layer LSTM(64)) — fewer parameters for 8 training subjects
 """
 import torch
 import torch.nn as nn
@@ -80,8 +82,27 @@ class CNNTCN(nn.Module):
         return self.fc(h).squeeze(-1)
 
 
+class CNNBiLSTM(nn.Module):
+    """Offline variant: same conv block, bidirectional LSTM (sees the whole trial, past and future)."""
+    def __init__(self, in_ch=8, hidden=128, layers=2, dropout=0.3):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(in_ch, 32, 15, padding=7), nn.BatchNorm1d(32), nn.ReLU(),
+            nn.Conv1d(32, 64, 15, padding=7), nn.BatchNorm1d(64), nn.ReLU())
+        self.lstm = nn.LSTM(64, hidden, layers, dropout=dropout, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(2 * hidden, 1)
+
+    def forward(self, x):
+        h = self.conv(x.permute(0, 2, 1)).permute(0, 2, 1)
+        h, _ = self.lstm(h)
+        return self.fc(h).squeeze(-1)
+
+
 def make_model(name, in_ch):
-    return {"cnn_lstm": CNNLSTM, "cnn": CNNOnly, "lstm": LSTMOnly, "cnn_tcn": CNNTCN}[name](in_ch=in_ch)
+    return {"cnn_lstm": CNNLSTM, "cnn": CNNOnly, "lstm": LSTMOnly, "cnn_tcn": CNNTCN,
+            "bilstm": CNNBiLSTM,                                            # CNN + bidirectional LSTM(128)
+            "cnn_lstm_s": lambda in_ch: CNNLSTM(in_ch, hidden=64, layers=1),  # small CNN-LSTM
+            }[name](in_ch=in_ch)
 
 
 # ---------------------------------------------------------------- losses

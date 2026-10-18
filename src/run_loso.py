@@ -48,7 +48,7 @@ from sklearn.linear_model import Ridge
 from data import build_dataset, TARGETS, FS
 from models import make_model, LOSSES
 
-NETS = {"cnn_lstm", "cnn", "lstm", "cnn_tcn"}
+NETS = {"cnn_lstm", "cnn", "lstm", "cnn_tcn", "bilstm", "cnn_lstm_s"}
 ORACLES = {"oracle": (True, True), "oracle_shift": (True, False), "oracle_scale": (False, True)}
 
 
@@ -76,6 +76,13 @@ def get_args():
     ap.add_argument("--residual", action="store_true",
                     help="nets/ridge learn the deviation from the training template (template added back)")
     ap.add_argument("--wd", type=float, default=0.0, help="Adam weight decay")
+    ap.add_argument("--aug", action="store_true",
+                    help="nets: training-time augmentation (time shift +-1 s of EMG and target together, "
+                         "EMG gain, +-1 armband channel rotation, noise); time shift is off with --base")
+    ap.add_argument("--rel_input", action="store_true",
+                    help="nets: extra 8 input channels = EMG minus the person's own mean EMG envelope")
+    ap.add_argument("--rel_ntrials", type=int, default=0,
+                    help="emg_rel: build each person's reference EMG from only their first N trials (0 = all)")
     ap.add_argument("--base", default=None,
                     help="nets/ridge learn the deviation from this EMG-timed template "
                          "(emg_direct, emg_direct_rot, emg_rel, emg_rel_sub, ...)")
@@ -291,11 +298,15 @@ def fit_emg_rel(Xcal, Ycal, Scal, tm, E_subj, E_pop, use_sub):
     return predict, r, c / FS
 
 
+REL_NTRIALS = 0      # set from --rel_ntrials; 0 = person's mean EMG from all their trials
+
+
 def fit_timer(name, Xn, Yn, subj, tidx, tm, E_tm):
     """Fit an EMG-timed template (DIRECT or REL) on the calibration/template trials tidx."""
     if name in DIRECT:
         return fit_emg_direct(Xn[tidx], Yn[tidx], tm, E_tm, DIRECT[name])
-    E_subj = {s: Xn[subj == s].mean(0) for s in np.unique(subj)}
+    # person's reference EMG: mean envelope of their first REL_NTRIALS trials (in recording order)
+    E_subj = {s: Xn[np.where(subj == s)[0][:REL_NTRIALS or None]].mean(0) for s in np.unique(subj)}
     return fit_emg_rel(Xn[tidx], Yn[tidx], subj[tidx], tm, E_subj, E_tm, REL[name])
 
 
@@ -373,8 +384,34 @@ def fit_emg_align(Xtr, Ytr, Xva, Yva, tm, E_tm, feats="all", params="kab", blend
     return predict, r_lag, (al, w)
 
 
-def train_net(name, Xtr, Ytr, Xva, Yva, seed, a, dev):
+def augment(xb, yb, ob, a, gen):
+    """Training-time augmentation on a GPU batch. xb (B,T,C) inputs, yb (B,T) training target,
+    ob (B,T) offset the target is relative to (template / zeros); the TRUE signal is yb + ob."""
+    B, T, C = xb.shape
+    dev = xb.device
+    if not a.base:                                      # time shift: EMG and true signal move together
+        k = torch.randint(-MAX_SHIFT, MAX_SHIFT + 1, (B,), device=dev, generator=gen)
+        idx = (torch.arange(T, device=dev)[None, :] - k[:, None]).clamp(0, T - 1)
+        xb = torch.gather(xb, 1, idx[:, :, None].expand(-1, -1, C))
+        yb = torch.gather(yb + ob, 1, idx) - ob
+    g = 0.7 + 0.6 * torch.rand(B, 1, 1, device=dev, generator=gen)          # overall gain
+    g = g * (0.9 + 0.2 * torch.rand(B, 1, C, device=dev, generator=gen))  # per-channel gain
+    xb = xb * g
+    r = torch.randint(-1, 2, (B,), device=dev, generator=gen)              # armband rotation by +-1
+    xr = xb.reshape(B, T, C // 8, 8)
+    for v in (-1, 1):
+        m = r == v
+        if m.any():
+            xr[m] = torch.roll(xr[m], v, dims=3)
+    xb = xr.reshape(B, T, C)
+    xb = xb + 0.05 * torch.randn(xb.shape, device=dev, generator=gen)
+    return xb, yb
+
+
+def train_net(name, Xtr, Ytr, Xva, Yva, seed, a, dev, Otr=None):
     torch.manual_seed(seed); np.random.seed(seed)
+    gen = torch.Generator(device=dev); gen.manual_seed(seed)
+    Ot = torch.tensor(np.zeros_like(Ytr) if Otr is None else Otr, device=dev, dtype=torch.float32)
     model = make_model(name, Xtr.shape[2]).to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, weight_decay=a.wd)
     loss_fn = LOSSES[a.loss]
@@ -389,7 +426,10 @@ def train_net(name, Xtr, Ytr, Xva, Yva, seed, a, dev):
             if len(b) < 2:              # BatchNorm needs >1 sample
                 continue
             b = torch.as_tensor(b, device=dev)
-            loss = loss_fn(Yt[b], model(Xt[b]))
+            xb, yb = Xt[b], Yt[b]
+            if a.aug:
+                xb, yb = augment(xb, yb, Ot[b], a, gen)
+            loss = loss_fn(yb, model(xb))
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -428,6 +468,8 @@ def metrics(Yt, Yp, Ytmpl):
 # ---------------------------------------------------------------- main
 def main():
     a = get_args()
+    global REL_NTRIALS
+    REL_NTRIALS = a.rel_ntrials
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={dev}")
@@ -464,6 +506,10 @@ def main():
             else:
                 off = np.zeros_like(Yn)
             Yfit = Yn - off
+            Xin = Xn                                 # network input
+            if a.rel_input:                          # + EMG relative to the person's own mean envelope
+                Eref = {s: Xn[np.where(subj == s)[0][:a.rel_ntrials or None]].mean(0) for s in np.unique(subj)}
+                Xin = np.concatenate([Xn, Xn - np.stack([Eref[s] for s in subj])], 2).astype(np.float32)
             for m in a.models:
                 if m not in NETS and seed != seeds_needed[0] and a.split == "loso":
                     continue                     # template / ridge are deterministic
@@ -492,20 +538,22 @@ def main():
                 elif m == "ridge":
                     Pn = fit_ridge(Xn[tr], Yfit[tr], Xn[va], Yfit[va])(Xn[te]) + off[te]
                 else:
-                    pred, ep, npar = train_net(m, Xn[tr], Yfit[tr], Xn[va], Yfit[va], seed, a, dev)
-                    Pn = pred(Xn[te]) + off[te]
+                    pred, ep, npar = train_net(m, Xin[tr], Yfit[tr], Xin[va], Yfit[va], seed, a, dev, off[tr])
+                    Pn = pred(Xin[te]) + off[te]
                 P = nz.y_inv(Pn)
+                mname = f"{m}@{a.rel_ntrials}" if (m in REL and a.rel_ntrials) else m
                 # per-subject scores (for random split, the test set mixes subjects)
                 for s in sorted(set(subj[te])):
                     k = subj[te] == s
                     # how well the predicted time shift tracks the true one (emg_align only)
                     sh_r = (float(np.corrcoef(k_pred[k], k_true[k])[0, 1])
                             if k_pred is not None and k.sum() > 2 and np.std(k_true[k]) > 0 else np.nan)
-                    row = dict(model=m, loss=a.loss if m in NETS else "-", seed=seed, fold=fold, test_subject=s,
+                    row = dict(model=mname, loss=a.loss if m in NETS else "-", seed=seed, fold=fold, test_subject=s,
                                n_trials=int(k.sum()), alignment=a.alignment, split=a.split, norm=a.norm,
                                target=a.target, channels=" ".join(map(str, a.channels)), epochs=ep,
                                residual=int(bool(a.residual or a.base) and (m in NETS or m == "ridge")),
                                base=(a.base or "") if (m in NETS or m == "ridge") else "",
+                               aug=int(a.aug and m in NETS), rel_input=int(a.rel_input and m in NETS),
                                wd=a.wd if m in NETS else 0.0, shift_r=sh_r,
                                params=npar, secs=round(time.time() - t0, 1),
                                **metrics(Yt_true[k], P[k], Ytmpl[k]))
@@ -513,7 +561,7 @@ def main():
                 if a.save_preds:
                     np.savez(out / f"pred_{m}_seed{seed}_{fold}.npz", y=Yt_true, p=P,
                              subj=subj[te], trial=D["trial"][te])
-                last = [r for r in rows if r["model"] == m and r["fold"] == fold and r["seed"] == seed]
+                last = [r for r in rows if r["model"] == mname and r["fold"] == fold and r["seed"] == seed]
                 print(f"seed {seed} fold {fold:>8} {m:>9}: R2 {np.mean([r['r2'] for r in last]):.3f}  "
                       f"skill {np.mean([r['skill'] for r in last]):+.3f}  ({time.time() - t0:.0f}s, ep {ep})",
                       flush=True)
